@@ -1,0 +1,8 @@
+Color emoji artwork from Noto Color Emoji 2.051, copyright Google Inc.
+The atlases contain reduced-size bitmaps extracted from the font.
+https://github.com/googlefonts/noto-emoji/tree/v2.051
+License: NotoColorEmoji-OFL.txt
+
+Emoji names and sequences from Unicode Emoji 17.0, copyright Unicode, Inc.
+https://www.unicode.org/Public/17.0.0/emoji/emoji-test.txt
+License: Unicode-License.txt
