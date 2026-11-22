@@ -56,6 +56,7 @@ namespace Rovyn.UI
 
         readonly List<MessageItem> _items = new();
         readonly Dictionary<string, MessageItem> _itemsById = new();
+        readonly HashSet<string> _shownCalls = new();
         readonly List<VivoxMessage> _arrivedWhileLoading = new();
         readonly ReactionHistory _reactions = new();
         readonly HashSet<(string target, string emoji)> _sendingReactions = new();
@@ -106,6 +107,8 @@ namespace Rovyn.UI
             callButton.onClick.AddListener(() => MainScreen.Instance.StartCall(_peerId));
             profileButton.onClick.AddListener(() => MainScreen.Instance.ShowProfile(_peerId, fromChat: true));
             App.Chat.MessageReceived += OnMessage;
+            App.Chat.MessageRemoved += OnMessageRemoved;
+            App.Calls.HistoryChanged += OnCallHistoryChanged;
         }
 
         void OnEnable()
@@ -113,6 +116,7 @@ namespace Rovyn.UI
             App.Vivox.StateChanged += OnConnectionChanged;
             App.Friends.PresenceChanged += OnPresence;
             App.Friends.Changed += RefreshHeader;
+            App.Calls.StateChanged += RefreshCallButton;
             RefreshHeader();
         }
 
@@ -121,10 +125,22 @@ namespace Rovyn.UI
             App.Vivox.StateChanged -= OnConnectionChanged;
             App.Friends.PresenceChanged -= OnPresence;
             App.Friends.Changed -= RefreshHeader;
+            App.Calls.StateChanged -= RefreshCallButton;
             if (_emojiPicker != null) _emojiPicker.Close();
         }
 
-        void OnDestroy() => App.Chat.MessageReceived -= OnMessage;
+        void OnRectTransformDimensionsChange()
+        {
+            if (MainScreen.Instance != null && MainScreen.Instance.chatPage == this)
+                MainScreen.Instance.voicePage.ResizeCallPanel();
+        }
+
+        void OnDestroy()
+        {
+            App.Chat.MessageReceived -= OnMessage;
+            App.Chat.MessageRemoved -= OnMessageRemoved;
+            App.Calls.HistoryChanged -= OnCallHistoryChanged;
+        }
 
         // ---- Opening conversations ----
 
@@ -181,6 +197,7 @@ namespace Rovyn.UI
             foreach (var item in _items) Destroy(item.gameObject);
             _items.Clear();
             _itemsById.Clear();
+            _shownCalls.Clear();
             _arrivedWhileLoading.Clear();
             _reactions.Clear();
             _sendingReactions.Clear();
@@ -199,7 +216,11 @@ namespace Rovyn.UI
 
         async UniTaskVoid LoadAsync(int version)
         {
-            if (!App.Vivox.IsLoggedIn) return; // OnConnectionChanged retries after login
+            if (!App.Vivox.IsLoggedIn)
+            {
+                InsertCallHistory();
+                return; // OnConnectionChanged retries after login
+            }
             loading.SetActive(true);
             try
             {
@@ -212,6 +233,7 @@ namespace Rovyn.UI
                 foreach (var m in _arrivedWhileLoading) AcceptMessage(m);
                 _arrivedWhileLoading.Clear();
 
+                InsertCallHistory();
                 RefreshQuotes();
                 welcome.SetActive(_reachedStart);
                 _loaded = true;
@@ -220,7 +242,11 @@ namespace Rovyn.UI
             catch (Exception e)
             {
                 Debug.LogException(e);
-                if (version == _version) App.Report("Couldn't load messages. Try again in a moment.");
+                if (version == _version)
+                {
+                    InsertCallHistory();
+                    App.Report("Couldn't load messages. Try again in a moment.");
+                }
             }
             finally
             {
@@ -242,6 +268,7 @@ namespace Rovyn.UI
                 // Keep the messages on screen in place while older ones are inserted above.
                 float heightBefore = content.rect.height;
                 for (int i = older.Count - 1; i >= 0; i--) Prepend(older[i]);
+                InsertCallHistory();
                 RefreshQuotes();
                 LayoutRebuilder.ForceRebuildLayoutImmediate(content);
                 content.anchoredPosition += new Vector2(0f, content.rect.height - heightBefore);
@@ -277,6 +304,7 @@ namespace Rovyn.UI
 
                 foreach (var message in page)
                 {
+                    if (App.Chat.IsMessageRemoved(key, message.MessageId)) continue;
                     if (ChatMetadata.IsReaction(message))
                         ApplyReaction(message);
                     else if (!string.IsNullOrEmpty(message.MessageId) &&
@@ -318,6 +346,7 @@ namespace Rovyn.UI
 
         void AcceptMessage(VivoxMessage message)
         {
+            if (App.Chat.IsMessageRemoved(_key, message.MessageId)) return;
             if (ChatMetadata.IsReaction(message)) ApplyReaction(message);
             else Append(message);
         }
@@ -331,15 +360,15 @@ namespace Rovyn.UI
 
         MessageItem CreateItem(VivoxMessage message)
         {
-            if (string.IsNullOrEmpty(message.MessageId) || _itemsById.ContainsKey(message.MessageId)) return null;
+            if (string.IsNullOrEmpty(message.MessageId) || _itemsById.ContainsKey(message.MessageId)
+                || App.Chat.IsMessageRemoved(_key, message.MessageId)) return null;
             var item = Instantiate(messagePrefab, content, false);
             try
             {
                 item.Attach(this, _shape);
                 item.Set(message);
                 item.SetReactions(_reactions.For(message.MessageId, App.Auth.PlayerId));
-                if (item.Reply != null && _itemsById.TryGetValue(item.Reply.target, out var original))
-                    item.UpdateQuote(original);
+                RefreshQuote(item);
             }
             catch
             {
@@ -353,33 +382,108 @@ namespace Rovyn.UI
 
         void RefreshQuotes()
         {
-            foreach (var item in _items)
-                if (item.Reply != null && _itemsById.TryGetValue(item.Reply.target, out var original))
-                    item.UpdateQuote(original);
+            foreach (var item in _items) RefreshQuote(item);
+        }
+
+        void RefreshQuote(MessageItem item)
+        {
+            if (item.Reply == null) return;
+            if (App.Chat.IsMessageRemoved(_key, item.Reply.target)) item.MarkQuoteUnavailable();
+            else if (_itemsById.TryGetValue(item.Reply.target, out var original)) item.UpdateQuote(original);
         }
 
         void Append(VivoxMessage message)
         {
             var item = CreateItem(message);
             if (item == null) return;
-            item.SetHeader(!item.ContinuesFrom(_items.Count > 0 ? _items[_items.Count - 1] : null));
-            _items.Add(item);
+            InsertItem(item, _items.FindLastIndex(previous => previous.RawTime <= item.RawTime) + 1);
         }
 
         void Prepend(VivoxMessage message)
         {
             var item = CreateItem(message);
             if (item == null) return;
-            item.transform.SetSiblingIndex(welcome.transform.GetSiblingIndex() + 1);
-            item.SetHeader(true);
-            _items.Insert(0, item);
-            if (_items.Count > 1) _items[1].SetHeader(!_items[1].ContinuesFrom(item));
+            InsertItem(item, 0);
         }
 
-        bool IsAtBottom() =>
+        void InsertItem(MessageItem item, int index)
+        {
+            item.transform.SetSiblingIndex(welcome.transform.GetSiblingIndex() + 1 + index);
+            _items.Insert(index, item);
+            RefreshGroupAt(index);
+            RefreshGroupAt(index + 1);
+        }
+
+        void RefreshGroupAt(int index)
+        {
+            if (index >= _items.Count) return;
+            var item = _items[index];
+            item.SetHeader(!item.ContinuesFrom(index > 0 ? _items[index - 1] : null));
+        }
+
+        internal void RemoveMessage(MessageItem item, UnityEngine.UI.Button button)
+        {
+            if (!_itemsById.TryGetValue(item.MessageId, out var current) || current != item) return;
+            var key = _key;
+            if (!item.IsOwnMessage)
+            {
+                UiActions.Run(() =>
+                {
+                    App.Chat.HideMessage(key, item.MessageId);
+                    return UniTask.CompletedTask;
+                }, button);
+                return;
+            }
+            UiActions.Run(() => App.Chat.DeleteOwnMessageAsync(key, item.MessageId), button);
+        }
+
+        void OnMessageRemoved(string id)
+        {
+            if (_key == null || !App.Chat.IsMessageRemoved(_key, id)) return;
+            if (_reply?.target == id) SetReply(null);
+            _arrivedWhileLoading.RemoveAll(message => message.MessageId == id);
+            if (_itemsById.Remove(id, out var item))
+            {
+                bool atBottom = IsAtBottom();
+                int index = _items.IndexOf(item);
+                _items.RemoveAt(index);
+                item.gameObject.SetActive(false);
+                item.transform.SetAsLastSibling();
+                Destroy(item.gameObject);
+                RefreshGroupAt(index);
+                if (atBottom && isActiveAndEnabled) ScrollToBottomAsync().Forget();
+            }
+            foreach (var row in _items)
+                if (row.Reply?.target == id) row.MarkQuoteUnavailable();
+        }
+
+        void OnCallHistoryChanged(string peer)
+        {
+            if (!ChatService.IsDirect(_key) || ChatService.IdOf(_key) != peer || loading.activeSelf) return;
+            bool atBottom = IsAtBottom();
+            InsertCallHistory();
+            if (atBottom && isActiveAndEnabled) ScrollToBottomAsync().Forget();
+        }
+
+        void InsertCallHistory()
+        {
+            if (!ChatService.IsDirect(_key)) return;
+            var calls = CallHistory.Read(App.Auth.PlayerId, ChatService.IdOf(_key));
+            var phone = callButton.transform.Find("Icon")?.GetComponent<UnityEngine.UI.Image>()?.sprite;
+            foreach (var call in calls)
+            {
+                if (!_reachedStart && _historyBefore.HasValue && call.EndedAtUtc < _historyBefore.Value) continue;
+                if (!_shownCalls.Add(call.id)) continue;
+                var item = Instantiate(messagePrefab, content, false);
+                item.SetCallSummary(call, phone);
+                InsertItem(item, _items.FindLastIndex(previous => previous.RawTime <= item.RawTime) + 1);
+            }
+        }
+
+        internal bool IsAtBottom() =>
             content.rect.height <= scroll.viewport.rect.height + 0.01f || scroll.verticalNormalizedPosition <= 0.01f;
 
-        async UniTaskVoid ScrollToBottomAsync()
+        internal async UniTaskVoid ScrollToBottomAsync()
         {
             int version = _version;
             // Wait for the layout pass so the new content height is known.
@@ -411,7 +515,8 @@ namespace Rovyn.UI
         {
             int version = _version;
             int jump = ++_jumpVersion;
-            while (!_itemsById.ContainsKey(target) && !_reachedStart && version == _version && jump == _jumpVersion)
+            while (version == _version && jump == _jumpVersion && !_reachedStart && !_itemsById.ContainsKey(target)
+                && !App.Chat.IsMessageRemoved(_key, target))
             {
                 if (_loadingOlder)
                     await UniTask.WaitUntil(() => !_loadingOlder || version != _version);
@@ -579,7 +684,7 @@ namespace Rovyn.UI
 
             var activity = direct ? App.Friends.ActivityOf(_peerId) : null;
             topic.text = activity?.status ?? "";
-            callButton.gameObject.SetActive(direct && App.Friends.IsFriend(_peerId));
+            RefreshCallButton();
             profileButton.gameObject.SetActive(direct);
 
             bool blocked = direct && App.Friends.IsBlocked(_peerId);
@@ -592,6 +697,9 @@ namespace Rovyn.UI
                 : online ? $"Message {_label}"
                 : "Connecting to chat…";
         }
+
+        void RefreshCallButton() => callButton.gameObject.SetActive(
+            _peerId != null && App.Friends.IsFriend(_peerId) && !App.Calls.IsCalling(_peerId));
 
         void Send()
         {

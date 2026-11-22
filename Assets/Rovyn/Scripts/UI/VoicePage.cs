@@ -30,10 +30,16 @@ namespace Rovyn.UI
         public Button leaveButton;
 
         ItemList<ParticipantTile> _tiles;
+        Transform _standaloneParent;
+        RectTransform _rect;
+        UnityEngine.UI.LayoutElement _callLayout;
+        UnityEngine.UI.Image _callBackground;
+
+        internal bool IsEmbedded { get; private set; }
 
         void Awake()
         {
-            title.transform.parent.GetComponent<UnityEngine.UI.LayoutElement>().preferredHeight = 56f;
+            if (!IsEmbedded) title.transform.parent.GetComponent<UnityEngine.UI.LayoutElement>().preferredHeight = 56f;
             _tiles = new ItemList<ParticipantTile>(tilePrefab, grid.transform);
             muteButton.onClick.AddListener(() => App.Voice.SetMuted(!(App.Voice.IsMuted || App.Voice.IsDeafened)));
             deafenButton.onClick.AddListener(() => App.Voice.SetDeafened(!App.Voice.IsDeafened));
@@ -50,6 +56,7 @@ namespace Rovyn.UI
             App.Voice.StateChanged += Refresh;
             App.Voice.ParticipantsChanged += Refresh;
             App.Calls.StateChanged += Refresh;
+            App.Vivox.StateChanged += Refresh;
             Refresh();
         }
 
@@ -58,6 +65,7 @@ namespace Rovyn.UI
             App.Voice.StateChanged -= Refresh;
             App.Voice.ParticipantsChanged -= Refresh;
             App.Calls.StateChanged -= Refresh;
+            App.Vivox.StateChanged -= Refresh;
         }
 
         void OnRectTransformDimensionsChange()
@@ -65,18 +73,70 @@ namespace Rovyn.UI
             if (_tiles != null && isActiveAndEnabled) UpdateGrid();
         }
 
+        internal void EmbedIn(ChatPage chat)
+        {
+            bool embedded = chat != null;
+            if (IsEmbedded == embedded) return;
+
+            if (_rect == null)
+            {
+                _rect = (RectTransform)transform;
+                _standaloneParent = transform.parent;
+                _callLayout = gameObject.AddComponent<UnityEngine.UI.LayoutElement>();
+                _callLayout.flexibleHeight = 0;
+                _callBackground = gameObject.AddComponent<UnityEngine.UI.Image>();
+                _callBackground.color = Theme.Rail;
+                _callBackground.raycastTarget = false;
+            }
+
+            IsEmbedded = embedded;
+            _callBackground.enabled = embedded;
+            title.transform.parent.GetComponent<UnityEngine.UI.LayoutElement>().preferredHeight = embedded ? 34f : 56f;
+            controls.GetComponent<UnityEngine.UI.LayoutElement>().preferredHeight = embedded ? 54f : 88f;
+            controls.GetComponent<UnityEngine.UI.HorizontalLayoutGroup>().spacing = embedded ? 8f : 16f;
+            gridArea.offsetMin = new Vector2(16f, embedded ? 2f : 16f);
+            gridArea.offsetMax = -gridArea.offsetMin;
+
+            if (embedded)
+            {
+                var messages = chat.scroll.transform.parent;
+                _rect.SetParent(chat.transform, false);
+                _rect.SetSiblingIndex(messages.GetSiblingIndex());
+                ResizeCallPanel();
+            }
+            else
+            {
+                _rect.SetParent(_standaloneParent, false);
+                _rect.anchorMin = Vector2.zero;
+                _rect.anchorMax = Vector2.one;
+                _rect.offsetMin = _rect.offsetMax = Vector2.zero;
+            }
+
+            Refresh();
+        }
+
+        internal void ResizeCallPanel()
+        {
+            if (!IsEmbedded || transform.parent == _standaloneParent) return;
+            float available = ((RectTransform)transform.parent).rect.height;
+            _callLayout.preferredHeight = Mathf.Clamp(available * 0.36f, 122f, 248f);
+        }
+
         void Refresh()
         {
             if (_tiles == null) return;
-            bool inVoice = App.Voice.Channel != null;
-            emptyState.SetActive(!inVoice);
-            controls.SetActive(inVoice);
+            bool inVoice = App.Voice.Channel != null && (!IsEmbedded || App.Voice.IsPrivate);
+            bool showCall = inVoice || IsEmbedded;
+            emptyState.SetActive(!showCall);
+            controls.SetActive(showCall);
 
-            title.text = !inVoice ? "Voice"
+            title.text = IsEmbedded ? "Voice call"
+                : !inVoice ? "Voice"
                 : App.Voice.IsPrivate ? $"Call with {App.Voice.Label}"
                 : App.Voice.Label;
-            subtitle.text = !inVoice ? ""
-                : App.Voice.IsConnecting ? "Connecting…"
+            subtitle.text = !showCall ? ""
+                : App.Voice.IsReconnecting || App.Vivox.State == ConnectionState.Recovering ? "Reconnecting…"
+                : App.Voice.IsConnecting || !inVoice ? "Connecting…"
                 : App.Calls.State == CallState.Outgoing ? "Calling…"
                 : $"{App.Voice.Participants.Count} connected";
 
@@ -108,10 +168,19 @@ namespace Rovyn.UI
             int rows = Mathf.CeilToInt(count / (float)columns);
             float width = (area.width - spacing * (columns - 1)) / columns;
             float height = (area.height - spacing * (rows - 1)) / rows;
-            width = Mathf.Min(width, height * 16f / 9f, 640f);
             grid.constraint = GridLayoutGroup.Constraint.FixedColumnCount;
             grid.constraintCount = columns;
-            grid.cellSize = new Vector2(Mathf.Max(width, 120f), Mathf.Max(width, 120f) * 9f / 16f);
+            if (IsEmbedded)
+                grid.cellSize = new Vector2(Mathf.Clamp(width, 1f, 280f), Mathf.Clamp(height, 1f, 140f));
+            else
+            {
+                width = Mathf.Clamp(Mathf.Min(width, height * 16f / 9f), 120f, 640f);
+                grid.cellSize = new Vector2(width, width * 9f / 16f);
+            }
+
+            foreach (Transform child in grid.transform)
+                if (child.gameObject.activeSelf && child.TryGetComponent<ParticipantTile>(out var tile))
+                    tile.SetCompact(IsEmbedded, grid.cellSize.y);
         }
     }
 }

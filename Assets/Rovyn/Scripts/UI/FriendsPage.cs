@@ -47,6 +47,8 @@ namespace Rovyn.UI
         GameObject _tabIcon;
         GameObject _tabTitle;
         GameObject _tabDivider;
+        bool _tabLayoutPending;
+        bool? _compactTabs;
 
         void Awake()
         {
@@ -58,8 +60,6 @@ namespace Rovyn.UI
             _tabs.GetComponent<UnityEngine.UI.LayoutElement>().preferredHeight = 56;
             foreach (var button in tabButtons)
                 button.GetComponent<UnityEngine.UI.LayoutElement>().flexibleWidth = 0;
-            OnRectTransformDimensionsChange();
-
             var activity = GetComponentInChildren<ResponsiveHide>(true);
             activity.minWidth = 820f;
             var activityLayout = activity.target.GetComponent<UnityEngine.UI.LayoutElement>();
@@ -82,10 +82,15 @@ namespace Rovyn.UI
             copyMyId.onClick.AddListener(() => Copy(App.Auth.PlayerId, "Player ID copied."));
         }
 
-        void OnRectTransformDimensionsChange()
+        void OnRectTransformDimensionsChange() => _tabLayoutPending = true;
+
+        void LateUpdate()
         {
-            if (_tabs == null) return;
+            if (!_tabLayoutPending) return;
+            _tabLayoutPending = false;
             bool compact = ((RectTransform)transform).rect.width < 600f;
+            if (_compactTabs == compact) return;
+            _compactTabs = compact;
             _tabIcon.SetActive(!compact);
             _tabTitle.SetActive(!compact);
             _tabDivider.SetActive(!compact);
@@ -95,6 +100,7 @@ namespace Rovyn.UI
 
         void OnEnable()
         {
+            _tabLayoutPending = true;
             App.Friends.Changed += Refresh;
             App.Friends.PresenceChanged += OnPresence;
             Refresh();

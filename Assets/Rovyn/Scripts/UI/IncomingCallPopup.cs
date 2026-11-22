@@ -19,7 +19,6 @@ namespace Rovyn.UI
             {
                 var peer = App.Calls.PeerId;
                 MainScreen.Instance.OpenDirect(peer);
-                MainScreen.Instance.ShowVoice();
                 UiActions.Run(() => App.Calls.AcceptAsync());
             });
             declineButton.onClick.AddListener(() => UiActions.Run(() => App.Calls.DeclineAsync()));

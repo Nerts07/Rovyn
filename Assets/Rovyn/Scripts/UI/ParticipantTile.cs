@@ -46,6 +46,23 @@ namespace Rovyn.UI
             group.alpha = 0.6f;
         }
 
+        internal void SetCompact(bool compact, float height)
+        {
+            var icon = (RectTransform)avatar.transform;
+            float size = compact ? Mathf.Clamp(height - 27f, 0f, 54f) : 80f;
+            icon.gameObject.SetActive(size >= 18f);
+            icon.sizeDelta = new Vector2(size, size);
+            icon.anchoredPosition = new Vector2(0f, compact ? 9f : 0f);
+            avatar.initial.fontSize = Mathf.Round(size * 0.45f);
+
+            var caption = nameText.rectTransform;
+            caption.anchorMax = new Vector2(1f, 0f);
+            caption.pivot = Vector2.zero;
+            caption.offsetMin = new Vector2(compact ? 8f : 14f, compact ? 2f : 10f);
+            caption.offsetMax = new Vector2(-32f, compact ? 22f : 34f);
+            nameText.overflowMode = TextOverflowModes.Ellipsis;
+        }
+
         void Refresh()
         {
             var p = _watcher.Participant;

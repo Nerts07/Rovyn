@@ -40,7 +40,7 @@ namespace Rovyn.UI
         void Join()
         {
             if (string.IsNullOrEmpty(_channel)) return;
-            MainScreen.Instance.ShowVoice();
+            MainScreen.Instance.ShowVoicePage();
             UiActions.Run(async () =>
             {
                 if (App.Calls.State != CallState.None) await App.Calls.HangUpAsync();

@@ -39,8 +39,8 @@ namespace Rovyn.UI
             root.SetActive(App.Voice.Channel != null);
             if (App.Voice.Channel == null) return;
 
-            if (App.Voice.IsConnecting) Set("Connecting…", Theme.Yellow);
-            else if (App.Vivox.State == ConnectionState.Recovering) Set("Reconnecting…", Theme.Yellow);
+            if (App.Voice.IsReconnecting || App.Vivox.State == ConnectionState.Recovering) Set("Reconnecting…", Theme.Yellow);
+            else if (App.Voice.IsConnecting) Set("Connecting…", Theme.Yellow);
             else if (App.Calls.State == CallState.Outgoing) Set("Calling…", Theme.Yellow);
             else Set("Voice Connected", Theme.Green);
 

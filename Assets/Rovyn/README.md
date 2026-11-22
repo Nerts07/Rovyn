@@ -1,6 +1,6 @@
 # Rovyn setup notes
 
-Rovyn runs on Unity Gaming Services: Authentication for accounts, Friends for the social graph and presence, and Vivox for text and voice. There is no custom backend and no port forwarding.
+Rovyn uses Unity Authentication for accounts, Friends for relationships and presence, Vivox for text and voice, and Cloud Save for profile photos.
 
 ## Folder layout
 
@@ -24,15 +24,17 @@ The project is already linked to a cloud project (`ProjectSettings > cloudProjec
 2. **Friends**: open the Friends product page and enable it for the project. Until you do, the app logs you in and shows "Friends is not enabled for this project".
 3. **Vivox Voice and Text**: set it up for the project. The Vivox package picks up the project link on its own and gets its access tokens from UGS Authentication, so no Vivox key goes in the code.
 4. In the Editor, check **Project Settings > Services > Vivox** and leave **Test Mode** off for anything you ship. Test mode embeds the Vivox secret in the client.
+5. **Cloud Save**: enable it in the same environment for public profile photos. Rovyn creates the public `rovyn_avatar` entry for the signed-in player on their first upload. [Cloud Save Player Data](https://docs.unity.com/en-us/cloud-save/concepts/player-data)
 
 Player names (the `Name#1234` format used for friend requests) come with Authentication and need no extra step.
 
 ## What's connected
 
 - **Accounts.** Sign-up, login, logout, saved sessions (auto sign-in on launch through the stored session token), display name and password changes. UGS username/password has no email or recovery flow, so neither exists in the app. Validation follows the UGS rules: usernames 3-20 characters, passwords 8-30 with upper, lower, digit and symbol.
+- **Profile avatars.** In the Windows app, open **Settings > My Account > Upload avatar** and choose a PNG or JPEG under 10 MB and 32 megapixels. Rovyn center-crops it to a 128 × 128 image and stores it in Cloud Save, where other signed-in users can read it. Open views refresh roughly once a minute.
 - **Friends.** Requests by full name (`Name#1234`) or player ID, accept, ignore, cancel, remove, block and unblock, all live through the Friends event stream. Presence covers Online, Idle, Do Not Disturb and Invisible, plus a custom status and the voice channel you're in. Blocking someone also blocks them in Vivox.
-- **Text.** Vivox direct messages and server text channels, history with paging when you scroll up, a DM list rebuilt from Vivox conversations at login, and unread counts based on Vivox read flags. A sent message appears only once Vivox echoes it back.
-- **Voice.** Server voice channels, private calls, mute, deafen, input/output device selection, input and output volume, a mic test through a Vivox echo channel, per-user volume and local mute (saved per player), and speaking indicators. Connection loss shows a banner, Vivox recovery is reflected live, and a failed recovery offers a Reconnect button.
+- **Text.** Vivox direct messages and server text channels, paged history, a DM list rebuilt at login, and unread counts based on Vivox read flags. Senders can delete their own messages for everyone. Other messages can be hidden on this device.
+- **Voice.** Server voice channels, private calls above the DM history, mute, deafen, input/output devices and volume, a mic test through a Vivox echo channel, per-user volume and local mute (saved per player), and speaking indicators. Completed calls show their duration in the DM on this device. Rovyn tries to rejoin the audio channel if Vivox drops it while the session is still available.
 
 ## Limits worth knowing
 
@@ -44,4 +46,4 @@ Player names (the `Name#1234` format used for friend requests) come with Authent
 
 **Presence on quit.** Closing the window sets you offline with a 3-second limit. If the app crashes, friends see you online until the Friends service notices.
 
-**Not built.** Avatar uploads (avatars are colored initials), typing indicators, editing or deleting messages, and a minimum window size. Vivox supports message edit and delete, so those two are a small addition.
+**Not built.** Typing indicators, message editing, and a minimum window size.

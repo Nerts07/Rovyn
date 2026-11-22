@@ -1,4 +1,5 @@
 using System.Collections;
+using Cysharp.Threading.Tasks;
 using UnityEngine;
 
 namespace Rovyn.UI
@@ -40,7 +41,13 @@ namespace Rovyn.UI
             if (GetComponent<NotificationSound>() == null) gameObject.AddComponent<NotificationSound>();
         }
 
-        void OnDisable() => FinishPageFade();
+        void OnEnable() => App.Calls.StateChanged += RefreshCallPanel;
+
+        void OnDisable()
+        {
+            App.Calls.StateChanged -= RefreshCallPanel;
+            FinishPageFade();
+        }
 
         void OnDestroy()
         {
@@ -107,7 +114,7 @@ namespace Rovyn.UI
             serverSidebar.gameObject.SetActive(true);
             serverSidebar.Show(server);
 
-            if (server.textChannels.Length == 0) { ShowVoice(); return; }
+            if (server.textChannels.Length == 0) { ShowVoicePage(); return; }
             var channel = _lastChannel.TryGetValue(server.id, out var last) ? last : server.textChannels[0];
             OpenTextChannel(channel);
         }
@@ -125,7 +132,7 @@ namespace Rovyn.UI
         {
             if (CurrentServer == null) return;
             var id = ServerCatalog.VoiceChannelId(CurrentServer, channel);
-            ShowVoice();
+            ShowVoicePage();
             if (App.Voice.Channel == id) return;
             UiActions.Run(async () =>
             {
@@ -138,6 +145,17 @@ namespace Rovyn.UI
 
         public void ShowVoice()
         {
+            if (App.Calls.State is CallState.Outgoing or CallState.Active)
+            {
+                OpenDirect(App.Calls.PeerId);
+                return;
+            }
+
+            ShowVoicePage();
+        }
+
+        internal void ShowVoicePage()
+        {
             ShowPage(voicePage.gameObject);
             serverSidebar.SetSelection(null);
             homeSidebar.SetSelection(null);
@@ -149,16 +167,31 @@ namespace Rovyn.UI
         public void StartCall(string playerId)
         {
             OpenDirect(playerId);
-            ShowVoice();
+            if (App.Calls.IsCalling(playerId)) return;
             UiActions.Run(() => App.Calls.StartCallAsync(playerId));
+        }
+
+        void RefreshCallPanel()
+        {
+            if (chatPage.gameObject.activeSelf) UpdateVoicePage(chatPage.gameObject);
+        }
+
+        void UpdateVoicePage(GameObject page)
+        {
+            bool embedded = page == chatPage.gameObject && CurrentServer == null && App.Calls.IsCalling(_homeDirect);
+            bool changed = voicePage.IsEmbedded != embedded;
+            bool atBottom = changed && page == chatPage.gameObject && chatPage.IsAtBottom();
+            voicePage.EmbedIn(embedded ? chatPage : null);
+            voicePage.gameObject.SetActive(embedded || page == voicePage.gameObject);
+            if (atBottom) chatPage.ScrollToBottomAsync().Forget();
         }
 
         void ShowPage(GameObject page)
         {
-            bool changed = !page.activeSelf;
+            bool changed = !page.activeSelf || (page == voicePage.gameObject && voicePage.IsEmbedded);
             friendsPage.gameObject.SetActive(page == friendsPage.gameObject);
             chatPage.gameObject.SetActive(page == chatPage.gameObject);
-            voicePage.gameObject.SetActive(page == voicePage.gameObject);
+            UpdateVoicePage(page);
             if (page != chatPage.gameObject) App.Chat.SetOpen(null);
             if (!changed) return;
 
@@ -201,6 +234,16 @@ namespace Rovyn.UI
             LockWidth(rail.GetComponent<UnityEngine.UI.LayoutElement>(), RailWidth);
             var railLayout = rail.GetComponent<UnityEngine.UI.VerticalLayoutGroup>();
             railLayout.padding = new RectOffset(0, 0, 12, 12);
+
+            var divider = ChatWidgets.Rect(rail.transform, "Server Rail Divider");
+            ChatWidgets.Size(divider, -1, -1).ignoreLayout = true;
+            divider.anchorMin = new Vector2(1, 0);
+            divider.anchorMax = Vector2.one;
+            divider.offsetMin = new Vector2(ShellGap * 0.5f - 0.5f, 0);
+            divider.offsetMax = new Vector2(ShellGap * 0.5f + 0.5f, 0);
+            var dividerImage = divider.gameObject.AddComponent<UnityEngine.UI.Image>();
+            dividerImage.color = Theme.Divider;
+            dividerImage.raycastTarget = false;
 
             var sidebar = homeSidebar.transform.parent.parent;
             _sidebarLayout = sidebar.GetComponent<UnityEngine.UI.LayoutElement>();

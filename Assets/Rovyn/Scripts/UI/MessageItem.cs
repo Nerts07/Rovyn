@@ -27,6 +27,8 @@ namespace Rovyn.UI
         public DateTime RawTime { get; private set; } // as Vivox reported it, used for history paging
         internal string PlainText { get; private set; }
         internal ChatMetadata Reply { get; private set; }
+        internal bool IsCallSummary { get; private set; }
+        internal bool IsOwnMessage => SenderId == App.Auth.PlayerId;
 
         UnityEngine.UI.LayoutElement _rowSize;
         ChatPage _page;
@@ -41,6 +43,7 @@ namespace Rovyn.UI
 
         void Awake()
         {
+            if (IsCallSummary) return;
             layout.padding = new RectOffset(18, 16, 12, 2);
             layout.spacing = 12f;
             _rowSize = GetComponent<UnityEngine.UI.LayoutElement>();
@@ -99,7 +102,7 @@ namespace Rovyn.UI
 
         void ShowActions()
         {
-            if (_page == null || !_page.composer.interactable || string.IsNullOrEmpty(MessageId)) return;
+            if (_page == null || string.IsNullOrEmpty(MessageId)) return;
             if (_actions == null) _actions = MessageActions.Create(this, _page, _shape);
             _actions.Show();
         }
@@ -133,6 +136,54 @@ namespace Rovyn.UI
             if (original != null && original == this) return;
             EmojiCatalog.SetText(_quoteText, caption);
         }
+
+        internal void MarkQuoteUnavailable() => EmojiCatalog.SetText(_quoteText, "↪ Original message unavailable");
+
+        internal void SetCallSummary(CallHistory.Entry call, Sprite phone)
+        {
+            IsCallSummary = true;
+            RawTime = call.EndedAtUtc;
+            Time = RawTime.ToLocalTime();
+            var caller = App.Friends.NameOf(call.caller);
+            body.richText = false;
+            body.fontSize = 15;
+            body.color = Theme.TextMuted;
+            body.text = $"{caller} started a call that lasted {FormatDuration(TimeSpan.FromSeconds(call.seconds))}.  {Time:dd/MM/yyyy HH:mm}";
+            layout.padding.top = layout.padding.bottom = 7;
+            layout.childAlignment = TextAnchor.MiddleLeft;
+            var size = GetComponent<UnityEngine.UI.LayoutElement>();
+            size.minHeight = 36;
+            size.flexibleHeight = 0;
+            header.SetActive(false);
+            hoverTime.transform.parent.gameObject.SetActive(false);
+            avatar.gameObject.SetActive(true);
+            avatar.background.enabled = false;
+            avatar.initial.gameObject.SetActive(false);
+            ((RectTransform)avatar.transform).sizeDelta = new Vector2(40, 24);
+            var rect = ChatWidgets.Rect(avatar.transform, "Call Icon");
+            rect.anchorMin = rect.anchorMax = new Vector2(0.5f, 0.5f);
+            rect.anchoredPosition = new Vector2(-5, 0);
+            rect.sizeDelta = new Vector2(19, 19);
+            var icon = rect.gameObject.AddComponent<UnityEngine.UI.Image>();
+            icon.sprite = phone;
+            icon.color = Theme.Green;
+            icon.preserveAspect = true;
+            icon.raycastTarget = false;
+            if (TryGetComponent<UnityEngine.UI.Selectable>(out var selectable)) selectable.interactable = false;
+        }
+
+        static string FormatDuration(TimeSpan duration)
+        {
+            if (duration.TotalSeconds < 1) return "less than a second";
+            int hours = (int)duration.TotalHours;
+            if (hours > 0)
+                return duration.Minutes == 0 ? Count(hours, "hour") : $"{Count(hours, "hour")} {Count(duration.Minutes, "minute")}";
+            if (duration.Minutes > 0)
+                return duration.Seconds == 0 ? Count(duration.Minutes, "minute") : $"{Count(duration.Minutes, "minute")} {Count(duration.Seconds, "second")}";
+            return Count(duration.Seconds, "second");
+        }
+
+        static string Count(int value, string unit) => $"{value} {unit}{(value == 1 ? "" : "s")}";
 
         internal void SetReactions(IEnumerable<(string emoji, int count, bool own)> reactions)
         {
@@ -173,6 +224,7 @@ namespace Rovyn.UI
 
         public void SetHeader(bool show)
         {
+            if (IsCallSummary) return;
             header.SetActive(show);
             avatar.gameObject.SetActive(show);
             hoverTime.transform.parent.gameObject.SetActive(!show); // compact rows show the time on hover instead
@@ -184,7 +236,7 @@ namespace Rovyn.UI
 
         // Same author within 7 minutes continues the previous group.
         public bool ContinuesFrom(MessageItem previous) =>
-            Reply == null && previous != null && previous.SenderId == SenderId &&
+            !IsCallSummary && Reply == null && previous != null && !previous.IsCallSummary && previous.SenderId == SenderId &&
             (Time - previous.Time).TotalMinutes < 7;
 
         static DateTime ToLocal(DateTime time) => time.Kind == DateTimeKind.Utc ? time.ToLocalTime() : time;

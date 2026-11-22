@@ -16,6 +16,7 @@ namespace Rovyn
     public sealed class ChatService
     {
         public event Action<string, VivoxMessage> MessageReceived;
+        internal event Action<string> MessageRemoved;
         public event Action UnreadChanged;
         public event Action DirectListChanged;
 
@@ -27,6 +28,9 @@ namespace Rovyn
         readonly List<string> _partners = new();        // most recent first
         readonly Dictionary<string, int> _unread = new();
         readonly Dictionary<string, VivoxMessage> _lastIncoming = new();
+        readonly Dictionary<string, HashSet<string>> _hidden = new();
+        readonly HashSet<string> _deleted = new(StringComparer.Ordinal);
+        readonly HashSet<(string player, string message)> _deleting = new();
         string _lastDirectTarget;
         string _textChannel;
 
@@ -39,6 +43,8 @@ namespace Rovyn
         {
             Service.DirectedMessageReceived += OnDirectMessage;
             Service.ChannelMessageReceived += OnChannelMessage;
+            Service.ChannelMessageDeleted += OnMessageDeleted;
+            Service.DirectedMessageDeleted += OnMessageDeleted;
             App.Vivox.LoggedIn += OnLoggedIn;
         }
 
@@ -46,10 +52,14 @@ namespace Rovyn
         {
             Service.DirectedMessageReceived -= OnDirectMessage;
             Service.ChannelMessageReceived -= OnChannelMessage;
+            Service.ChannelMessageDeleted -= OnMessageDeleted;
+            Service.DirectedMessageDeleted -= OnMessageDeleted;
             App.Vivox.LoggedIn -= OnLoggedIn;
             _partners.Clear();
             _unread.Clear();
             _lastIncoming.Clear();
+            _hidden.Clear();
+            _deleted.Clear();
             _textChannel = null;
             OpenKey = null;
             DirectListChanged?.Invoke();
@@ -121,6 +131,62 @@ namespace Rovyn
         internal UniTask SendReactionAsync(string key, string target, string emoji, bool added) =>
             SendAsync(key, ChatMetadata.ReactionBody(target, emoji, added), null, reaction: true);
 
+        internal bool IsMessageRemoved(string key, string id) => !string.IsNullOrEmpty(id) &&
+            (_deleted.Contains(id) || HiddenMessages(key).Contains(id));
+
+        internal void HideMessage(string key, string id)
+        {
+            var hidden = HiddenMessages(key);
+            if (!hidden.Add(id)) return;
+            try
+            {
+                PlayerPrefs.SetString(HiddenMessagesKey(key), string.Join("\n", hidden));
+                PlayerPrefs.Save();
+            }
+            catch
+            {
+                hidden.Remove(id);
+                throw;
+            }
+            MessageRemoved?.Invoke(id);
+        }
+
+        HashSet<string> HiddenMessages(string key)
+        {
+            if (!_hidden.TryGetValue(key, out var hidden))
+            {
+                hidden = new HashSet<string>(PlayerPrefs.GetString(HiddenMessagesKey(key))
+                    .Split('\n', StringSplitOptions.RemoveEmptyEntries), StringComparer.Ordinal);
+                _hidden.Add(key, hidden);
+            }
+            return hidden;
+        }
+
+        static string HiddenMessagesKey(string key) => $"rovyn.hidden_messages.{App.Auth.PlayerId}.{key}";
+
+        internal async UniTask DeleteOwnMessageAsync(string key, string id)
+        {
+            if (App.Vivox.State != ConnectionState.Connected)
+                throw new InvalidOperationException("Reconnect to chat to delete this message.");
+
+            var pending = (App.Auth.PlayerId, id);
+            if (!_deleting.Add(pending)) return;
+            try
+            {
+                if (IsDirect(key)) await Service.DeleteDirectTextMessageAsync(id);
+                else await Service.DeleteChannelTextMessageAsync(IdOf(key), id);
+                if (App.SessionActive && pending.Item1 == App.Auth.PlayerId) RegisterDeletion(id);
+            }
+            finally { _deleting.Remove(pending); }
+        }
+
+        void OnMessageDeleted(VivoxMessage message) => RegisterDeletion(message.MessageId);
+
+        void RegisterDeletion(string id)
+        {
+            if (!string.IsNullOrEmpty(id) && _deleted.Add(id)) MessageRemoved?.Invoke(id);
+        }
+
         async UniTask SendAsync(string key, string text, MessageOptions options, bool reaction = false)
         {
             text = text?.Trim();
@@ -154,6 +220,7 @@ namespace Rovyn
 
         void Deliver(string key, VivoxMessage m)
         {
+            if (IsMessageRemoved(key, m.MessageId)) return;
             if (!m.FromSelf)
             {
                 _lastIncoming[key] = m;
@@ -201,7 +268,8 @@ namespace Rovyn
                     var history = await Service.GetDirectTextMessageHistoryAsync(partner, 20);
                     var last = history.LastOrDefault(m => !m.FromSelf);
                     if (last != null) _lastIncoming[key] = last;
-                    int unread = history.Count(m => !m.FromSelf && !m.IsRead && !ChatMetadata.IsReaction(m));
+                    int unread = history.Count(m => !m.FromSelf && !m.IsRead && !ChatMetadata.IsReaction(m)
+                        && !IsMessageRemoved(key, m.MessageId));
                     if (unread > 0 && key != OpenKey) _unread[key] = unread;
                 }
                 UnreadChanged?.Invoke();

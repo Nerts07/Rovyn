@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using Cysharp.Threading.Tasks;
 using Unity.Services.Vivox;
 using UnityEngine;
@@ -18,6 +19,7 @@ namespace Rovyn
         public string Channel { get; private set; }  // Vivox channel name
         public string Label { get; private set; }    // what the UI shows, e.g. "Lounge"
         public bool IsConnecting { get; private set; }
+        public bool IsReconnecting { get; private set; }
         public bool IsConnected => Channel != null && !IsConnecting;
         public bool IsPrivate { get; private set; }
         public bool IsMuted { get; private set; }
@@ -37,6 +39,9 @@ namespace Rovyn
         static string UserVolumePref(string id) => "rovyn.voice.user." + id;
 
         bool _leaving;
+        int _channelVersion;
+        readonly SemaphoreSlim _channelChange = new(1, 1);
+        readonly HashSet<string> _mutedPlayers = new();
 
         public IReadOnlyList<VivoxParticipant> Participants =>
             Channel != null && Service.ActiveChannels.TryGetValue(Channel, out var list) ? list : NoParticipants;
@@ -49,6 +54,7 @@ namespace Rovyn
             Service.ParticipantRemovedFromChannel += OnParticipantRemoved;
             Service.AvailableInputDevicesChanged += OnDevicesChanged;
             Service.AvailableOutputDevicesChanged += OnDevicesChanged;
+            Service.EffectiveOutputDeviceChanged += OnEffectiveOutputChanged;
             App.Vivox.LoggedIn += ApplySavedSettings;
             App.Vivox.StateChanged += OnConnectionChanged;
             IsMuted = PlayerPrefs.GetInt(MutedPref, 0) == 1;
@@ -63,6 +69,7 @@ namespace Rovyn
             Service.ParticipantRemovedFromChannel -= OnParticipantRemoved;
             Service.AvailableInputDevicesChanged -= OnDevicesChanged;
             Service.AvailableOutputDevicesChanged -= OnDevicesChanged;
+            Service.EffectiveOutputDeviceChanged -= OnEffectiveOutputChanged;
             App.Vivox.LoggedIn -= ApplySavedSettings;
             App.Vivox.StateChanged -= OnConnectionChanged;
             ClearChannel();
@@ -73,40 +80,64 @@ namespace Rovyn
         // Private channels (calls) are shown to friends as "Private call" without a joinable channel.
         public async UniTask JoinAsync(string channel, string label, bool isPrivate = false)
         {
-            if (Channel == channel) return;
-            if (!App.Vivox.IsLoggedIn) throw new InvalidOperationException("Not connected to voice.");
-            await StopMicTestAsync();
-            await LeaveAsync();
-
-            Channel = channel;
-            Label = label;
-            IsConnecting = true;
-            StateChanged?.Invoke();
+            await _channelChange.WaitAsync();
             try
             {
-                await Service.JoinGroupChannelAsync(channel, ChatCapability.AudioOnly);
+                if (Channel == channel) return;
+                if (App.Vivox.State != ConnectionState.Connected) throw new InvalidOperationException("Not connected to voice.");
+                await StopMicTestAsync();
+                await LeaveChannelAsync();
+                if (!App.SessionActive || App.Vivox.State != ConnectionState.Connected)
+                    throw new InvalidOperationException("Not connected to voice.");
+
+                Channel = channel;
+                Label = label;
+                IsPrivate = isPrivate;
+                IsConnecting = true;
+                StateChanged?.Invoke();
+                int version = _channelVersion;
+                try
+                {
+                    await JoinAudioAsync(channel);
+                }
+                catch
+                {
+                    if (version == _channelVersion) ClearChannel();
+                    throw;
+                }
+                if (version != _channelVersion) return;
+                IsConnecting = false;
+                StateChanged?.Invoke();
+                ParticipantsChanged?.Invoke();
+                if (isPrivate) App.Friends.SetVoiceActivityAsync("Private call", null).Forget();
+                else App.Friends.SetVoiceActivityAsync(label, channel).Forget();
             }
-            catch
-            {
-                ClearChannel();
-                throw;
-            }
-            IsConnecting = false;
-            StateChanged?.Invoke();
-            ParticipantsChanged?.Invoke();
-            IsPrivate = isPrivate;
-            if (isPrivate) App.Friends.SetVoiceActivityAsync("Private call", null).Forget();
-            else App.Friends.SetVoiceActivityAsync(label, channel).Forget();
+            finally { _channelChange.Release(); }
         }
 
-        public async UniTask LeaveAsync()
+        public async UniTask LeaveAsync(string expectedChannel = null)
+        {
+            await _channelChange.WaitAsync();
+            try
+            {
+                if (expectedChannel == null || expectedChannel == Channel) await LeaveChannelAsync();
+            }
+            finally { _channelChange.Release(); }
+        }
+
+        async UniTask LeaveChannelAsync()
         {
             if (Channel == null) return;
             var channel = Channel;
             _leaving = true;
             try
             {
-                if (Service.ActiveChannels.ContainsKey(channel))
+                if (App.Vivox.State == ConnectionState.Recovering)
+                {
+                    ClearChannel();
+                    await UniTask.WaitUntil(() => App.Vivox.State != ConnectionState.Recovering || !App.SessionActive);
+                }
+                if (App.Vivox.State == ConnectionState.Connected && Service.ActiveChannels.ContainsKey(channel))
                     await Service.LeaveChannelAsync(channel);
             }
             catch (Exception e) { Debug.LogWarning($"Leaving voice failed: {e.Message}"); }
@@ -119,8 +150,11 @@ namespace Rovyn
             bool had = Channel != null;
             Channel = null;
             Label = null;
+            _channelVersion++;
             IsConnecting = false;
+            IsReconnecting = false;
             IsPrivate = false;
+            _mutedPlayers.Clear();
             if (!had) return;
             StateChanged?.Invoke();
             ParticipantsChanged?.Invoke();
@@ -141,13 +175,59 @@ namespace Rovyn
                 return;
             }
             if (channel != Channel || _leaving || IsConnecting) return;
-            App.Report("Disconnected from voice.");
+            if (App.Vivox.IsLoggedIn && App.SessionActive)
+            {
+                IsConnecting = true;
+                IsReconnecting = true;
+                StateChanged?.Invoke();
+                ParticipantsChanged?.Invoke();
+                Debug.LogWarning("Vivox audio channel disconnected. Rejoining current voice session.");
+                RejoinAsync(channel, _channelVersion).Forget();
+            }
+            else ClearChannel();
+        }
+
+        async UniTask JoinAudioAsync(string channel)
+        {
+            if (!Service.ActiveChannels.ContainsKey(channel))
+                await Service.JoinGroupChannelAsync(channel, ChatCapability.AudioOnly);
+            if (!Service.ActiveChannels.ContainsKey(channel))
+                throw new InvalidOperationException("Vivox did not connect to the audio channel.");
+            RestoreOutputState();
+        }
+
+        async UniTaskVoid RejoinAsync(string channel, int version)
+        {
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                await UniTask.Delay(TimeSpan.FromSeconds(1 << attempt), ignoreTimeScale: true);
+                await UniTask.WaitUntil(() => version != _channelVersion || App.Vivox.State != ConnectionState.Recovering);
+                await _channelChange.WaitAsync();
+                try
+                {
+                    if (version != _channelVersion || !App.SessionActive) return;
+                    if (App.Vivox.State != ConnectionState.Connected) continue;
+                    await JoinAudioAsync(channel);
+                    if (version != _channelVersion) return;
+                    IsConnecting = false;
+                    IsReconnecting = false;
+                    StateChanged?.Invoke();
+                    ParticipantsChanged?.Invoke();
+                    return;
+                }
+                catch (Exception e) { Debug.LogWarning($"Vivox audio recovery attempt {attempt + 1}: {e.Message}"); }
+                finally { _channelChange.Release(); }
+            }
+            if (version != _channelVersion) return;
             ClearChannel();
+            App.Report("Couldn't reconnect to voice.");
         }
 
         void OnConnectionChanged()
         {
             Capture.QueueApply();
+            if (App.Vivox.State == ConnectionState.Connected && Channel != null)
+                RestoreOutputState();
             // Vivox rejoins channels itself while recovering. If recovery fails the channel is gone.
             if (App.Vivox.State == ConnectionState.Failed || App.Vivox.State == ConnectionState.Offline)
             {
@@ -163,6 +243,7 @@ namespace Rovyn
             if (p.ChannelName != Channel) return;
             if (!p.IsSelf && PlayerPrefs.HasKey(UserVolumePref(p.PlayerId)))
                 p.SetLocalVolume(PlayerPrefs.GetInt(UserVolumePref(p.PlayerId)));
+            if (_mutedPlayers.Contains(p.PlayerId)) p.MutePlayerLocally();
             ParticipantsChanged?.Invoke();
         }
 
@@ -213,7 +294,16 @@ namespace Rovyn
 
         public void SetUserMuted(VivoxParticipant p, bool muted)
         {
-            if (muted) p.MutePlayerLocally(); else p.UnmutePlayerLocally();
+            if (muted)
+            {
+                p.MutePlayerLocally();
+                _mutedPlayers.Add(p.PlayerId);
+            }
+            else
+            {
+                p.UnmutePlayerLocally();
+                _mutedPlayers.Remove(p.PlayerId);
+            }
         }
 
         // ---- Devices and volume ----
@@ -239,6 +329,7 @@ namespace Rovyn
         {
             await Service.SetActiveOutputDeviceAsync(device);
             PlayerPrefs.SetString(OutputDevicePref, device.DeviceID);
+            RestoreOutputState();
         }
 
         public void SetInputVolume(int value)
@@ -256,6 +347,31 @@ namespace Rovyn
         }
 
         void OnDevicesChanged() => DevicesChanged?.Invoke();
+
+        void OnEffectiveOutputChanged()
+        {
+            if (Channel != null || IsMicTesting)
+            {
+                Debug.Log("Vivox playback device changed during voice.");
+                RestoreOutputState();
+            }
+            DevicesChanged?.Invoke();
+        }
+
+        void RestoreOutputState()
+        {
+            if (App.Vivox.State != ConnectionState.Connected || !Service.IsLoggedIn) return;
+            try
+            {
+                Service.SetOutputDeviceVolume(OutputVolume);
+                if (Service.IsOutputDeviceMuted != IsDeafened)
+                {
+                    if (IsDeafened) Service.MuteOutputDevice();
+                    else Service.UnmuteOutputDevice();
+                }
+            }
+            catch (Exception e) { Debug.LogWarning($"Restoring Vivox output failed: {e.Message}"); }
+        }
 
         void ApplySavedSettings() => ApplySavedSettingsAsync().Forget();
 

@@ -12,8 +12,9 @@ namespace Rovyn
     [Serializable]
     public class CallSignal
     {
-        public string type;    // ring, accept, decline, cancel
+        public string type;    // ring, accept, decline, cancel, hangup
         public string channel; // Vivox channel both sides join
+        public string callId;
     }
 
     // Private 1:1 voice calls. Ringing goes through Friends messages (friends only),
@@ -21,6 +22,7 @@ namespace Rovyn
     public sealed class CallService
     {
         public event Action StateChanged;
+        internal event Action<string> HistoryChanged;
 
         public CallState State { get; private set; }
         public string PeerId { get; private set; }
@@ -28,7 +30,15 @@ namespace Rovyn
         const int RingTimeoutSeconds = 45;
 
         string _channel;
+        string _callId;
+        string _callerId;
+        string _historyOwner;
+        double? _connectedAt;
         int _callVersion; // invalidates stale ring timeouts
+        int? _joiningVersion;
+        bool _startingCall;
+
+        internal bool IsCalling(string peerId) => PeerId == peerId && State is CallState.Outgoing or CallState.Active;
 
         public static string ChannelFor(string a, string b) =>
             string.CompareOrdinal(a, b) < 0 ? $"call.{a}.{b}" : $"call.{b}.{a}";
@@ -50,69 +60,86 @@ namespace Rovyn
 
         public async UniTask StartCallAsync(string peerId)
         {
+            if (_startingCall || IsCalling(peerId)) return;
             if (!App.Friends.IsFriend(peerId)) throw new InvalidOperationException("You can only call friends.");
-            if (State != CallState.None) await HangUpAsync();
-            // Leave any other voice channel first, otherwise that leave would read as the call ending.
-            await App.Voice.LeaveAsync();
-
-            _channel = ChannelFor(App.Auth.PlayerId, peerId);
-            SetState(CallState.Outgoing, peerId);
-            int version = _callVersion;
+            _startingCall = true;
             try
             {
-                await App.Voice.JoinAsync(_channel, App.Friends.NameOf(peerId), isPrivate: true);
-                if (version != _callVersion) return;
-                await App.Friends.SendMessageAsync(peerId, new CallSignal { type = "ring", channel = _channel });
+                if (State != CallState.None) await HangUpAsync();
+                if (!App.SessionActive) return;
+                var channel = ChannelFor(App.Auth.PlayerId, peerId);
+                _channel = channel;
+                _callId = Guid.NewGuid().ToString("N");
+                _callerId = App.Auth.PlayerId;
+                SetState(CallState.Outgoing, peerId);
+                int version = _callVersion;
+                await ConnectCallAsync(peerId, channel, version, "ring");
+                if (version == _callVersion) RingTimeoutAsync(version).Forget();
             }
-            catch
-            {
-                SetState(CallState.None, null);
-                await App.Voice.LeaveAsync();
-                throw;
-            }
-            RingTimeoutAsync(version).Forget();
+            finally { _startingCall = false; }
         }
 
         public async UniTask AcceptAsync()
         {
             if (State != CallState.Incoming) return;
             var peer = PeerId;
-            await App.Voice.LeaveAsync();
-            if (State != CallState.Incoming || PeerId != peer) return; // caller hung up meanwhile
+            var channel = _channel;
             SetState(CallState.Active, peer);
+            await ConnectCallAsync(peer, channel, _callVersion, "accept");
+        }
+
+        async UniTask ConnectCallAsync(string peer, string channel, int version, string signal)
+        {
+            _joiningVersion = version;
             try
             {
-                await App.Voice.JoinAsync(_channel, App.Friends.NameOf(peer), isPrivate: true);
-                await App.Friends.SendMessageAsync(peer, new CallSignal { type = "accept", channel = _channel });
+                await App.Voice.JoinAsync(channel, App.Friends.NameOf(peer), isPrivate: true);
+                if (version != _callVersion) return;
+                if (App.Voice.Channel != channel) throw new InvalidOperationException("Couldn't connect to call audio.");
+                await App.Friends.SendMessageAsync(peer, new CallSignal { type = signal, channel = channel, callId = _callId });
             }
             catch
             {
+                if (version != _callVersion) return;
                 SetState(CallState.None, null);
+                await App.Voice.LeaveAsync(channel);
                 throw;
+            }
+            finally
+            {
+                if (_joiningVersion == version) _joiningVersion = null;
+                if (version == _callVersion) OnVoiceChanged();
             }
         }
 
         public async UniTask DeclineAsync()
         {
             if (State != CallState.Incoming) return;
-            var peer = PeerId;
-            SetState(CallState.None, null);
-            await Signal(peer, "decline");
+            await HangUpAsync();
         }
 
         public async UniTask HangUpAsync()
         {
+            if (State == CallState.None) return;
             var peer = PeerId;
-            var wasOutgoing = State == CallState.Outgoing;
+            var channel = _channel;
+            var callId = _callId;
+            var signal = State switch
+            {
+                CallState.Outgoing => "cancel",
+                CallState.Incoming => "decline",
+                _ => "hangup",
+            };
             SetState(CallState.None, null);
-            if (wasOutgoing) await Signal(peer, "cancel");
-            if (App.Voice.Channel != null && App.Voice.Channel == _channel) await App.Voice.LeaveAsync();
+            var send = Signal(peer, channel, callId, signal);
+            if (signal != "decline") await App.Voice.LeaveAsync(channel);
+            await send;
         }
 
-        async UniTask Signal(string peer, string type)
+        async UniTask Signal(string peer, string channel, string callId, string type)
         {
             if (string.IsNullOrEmpty(peer)) return;
-            try { await App.Friends.SendMessageAsync(peer, new CallSignal { type = type, channel = _channel }); }
+            try { await App.Friends.SendMessageAsync(peer, new CallSignal { type = type, channel = channel, callId = callId }); }
             catch (Exception e) { Debug.LogWarning($"Call signal '{type}' failed: {e.Message}"); }
         }
 
@@ -126,18 +153,32 @@ namespace Rovyn
             // Only accept the channel both sides would compute, so a message can't pull us into another channel.
             var expected = ChannelFor(App.Auth.PlayerId, e.UserId);
             if (signal.channel != expected) return;
+            // Older clients only send the channel. New clients also identify the individual call.
+            if (signal.type != "ring" && signal.callId != null && signal.callId != _callId) return;
 
             switch (signal.type)
             {
                 case "ring":
                     if (App.Friends.IsBlocked(e.UserId)) return;
-                    if (State != CallState.None)
+                    if (IsCalling(e.UserId) && signal.callId != null && _callId != null)
                     {
-                        // Already in a call: tell the caller we're busy.
-                        App.Friends.SendMessageAsync(e.UserId, new CallSignal { type = "decline", channel = expected }).Forget();
+                        // Both clients can ring at once and join the same channel.
+                        if (string.CompareOrdinal(signal.callId, _callId) < 0)
+                        {
+                            _callId = signal.callId;
+                            _callerId = e.UserId;
+                        }
+                        return;
+                    }
+                    if (_startingCall || State != CallState.None)
+                    {
+                        if (PeerId == e.UserId && signal.callId != null && signal.callId == _callId) return;
+                        Signal(e.UserId, expected, signal.callId, "decline").Forget();
                         return;
                     }
                     _channel = expected;
+                    _callId = signal.callId;
+                    _callerId = e.UserId;
                     SetState(CallState.Incoming, e.UserId);
                     RingTimeoutAsync(_callVersion).Forget();
                     break;
@@ -146,9 +187,14 @@ namespace Rovyn
                     SetState(CallState.None, null);
                     break;
 
+                case "cancel" when State == CallState.Active && PeerId == e.UserId:
+                case "hangup" when IsCalling(e.UserId):
+                    EndRemoteCallAsync().Forget();
+                    break;
+
                 case "decline" when State == CallState.Outgoing && PeerId == e.UserId:
                     App.Report($"{App.Friends.NameOf(e.UserId)} declined the call.");
-                    HangUpAsync().Forget();
+                    EndRemoteCallAsync().Forget();
                     break;
 
                 case "accept" when State == CallState.Outgoing && PeerId == e.UserId:
@@ -157,19 +203,49 @@ namespace Rovyn
             }
         }
 
+        async UniTaskVoid EndRemoteCallAsync()
+        {
+            var channel = _channel;
+            SetState(CallState.None, null);
+            await App.Voice.LeaveAsync(channel);
+        }
+
         void OnParticipantsChanged()
         {
             // The peer showing up in the channel also means the call connected.
             if (State == CallState.Outgoing && App.Voice.Channel == _channel
                 && App.Voice.Participants.Any(p => p.PlayerId == PeerId))
                 SetState(CallState.Active, PeerId);
+            StartCallClock();
         }
 
         void OnVoiceChanged()
         {
             // Leaving the call channel by any route (disconnect button, joining another channel) ends the call.
-            if ((State == CallState.Outgoing || State == CallState.Active) && App.Voice.Channel != _channel && !App.Voice.IsConnecting)
+            if (IsCalling(PeerId) && _joiningVersion != _callVersion && App.Voice.Channel != _channel)
                 SetState(CallState.None, null);
+            StartCallClock();
+        }
+
+        void StartCallClock()
+        {
+            if (_connectedAt.HasValue || State != CallState.Active || App.Voice.Channel != _channel
+                || !App.Voice.IsConnected || !App.Voice.Participants.Any(p => p.PlayerId == PeerId)) return;
+            _historyOwner = App.Auth.PlayerId;
+            _connectedAt = Time.realtimeSinceStartupAsDouble;
+        }
+
+        void SaveCompletedCall(string peer)
+        {
+            if (!_connectedAt.HasValue) return;
+            int seconds = (int)(Time.realtimeSinceStartupAsDouble - _connectedAt.Value);
+            _connectedAt = null;
+            try
+            {
+                CallHistory.Record(_historyOwner, peer, _callId ?? Guid.NewGuid().ToString("N"), _callerId, seconds);
+                HistoryChanged?.Invoke(peer);
+            }
+            catch (Exception e) { Debug.LogWarning($"Couldn't save call history: {e.Message}"); }
         }
 
         async UniTaskVoid RingTimeoutAsync(int version)
@@ -189,9 +265,11 @@ namespace Rovyn
         void SetState(CallState state, string peerId)
         {
             if (state == State && peerId == PeerId) return;
+            var previousPeer = PeerId;
             if (state is CallState.Incoming or CallState.Outgoing or CallState.None) _callVersion++;
             State = state;
             PeerId = peerId;
+            if (state == CallState.None) SaveCompletedCall(previousPeer);
             StateChanged?.Invoke();
         }
     }

@@ -28,7 +28,7 @@ namespace Rovyn
         public async UniTask InitializeAsync()
         {
             if (Service.InitializationState != VivoxInitializationState.Initialized)
-                await Service.InitializeAsync();
+                await Service.InitializeAsync(new VivoxConfigurationOptions { LostRtpTimeoutMs = 15000 });
 
             if (_subscribed) return;
             _subscribed = true;

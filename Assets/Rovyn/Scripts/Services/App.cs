@@ -14,6 +14,7 @@ namespace Rovyn
         public static readonly ChatService Chat = new();
         public static readonly VoiceService Voice = new();
         public static readonly CallService Calls = new();
+        internal static readonly AvatarService Avatars = new();
 
         // Short user-facing notices (errors, confirmations). Shown by the Toast view.
         public static event Action<string> Notice;
@@ -42,6 +43,7 @@ namespace Rovyn
         {
             if (SessionActive) return;
             SessionActive = true;
+            Avatars.Start();
 
             try { await Friends.StartAsync(); }
             catch (Exception e) { Report($"Friends unavailable: {FriendsStore.Describe(e)}"); Debug.LogException(e); }
@@ -56,6 +58,7 @@ namespace Rovyn
         {
             if (!SessionActive) return;
             SessionActive = false;
+            Avatars.Stop();
 
             Calls.Stop();
             await Voice.LeaveAsync();

@@ -71,6 +71,7 @@ namespace Rovyn.UI
             });
             saveName.button.onClick.AddListener(() => SaveNameAsync().Forget());
             savePassword.button.onClick.AddListener(() => SavePasswordAsync().Forget());
+            AvatarSettings.Install(avatar, fullName, (displayName.input.targetGraphic as UnityEngine.UI.Image)?.sprite);
 
             inputDevice.onValueChanged.AddListener(OnInputDevice);
             outputDevice.onValueChanged.AddListener(OnOutputDevice);

@@ -11,6 +11,7 @@ namespace Rovyn.UI
         const int Spacing = 3;
         const int Padding = 5;
         const int Height = 34;
+        const int RemoveWidth = 88;
 
         readonly TMP_Text[] _reactionLabels = new TMP_Text[ChatPage.QuickReactionCount];
         readonly UnityEngine.UI.Button[] _reactionButtons = new UnityEngine.UI.Button[ChatPage.QuickReactionCount];
@@ -18,6 +19,11 @@ namespace Rovyn.UI
         MessageItem _message;
         ChatPage _page;
         string[] _recent;
+        UnityEngine.UI.Button _picker;
+        UnityEngine.UI.Button _reply;
+        UnityEngine.UI.Button _remove;
+        TMP_Text _removeLabel;
+        bool _confirmDelete;
 
         internal static MessageActions Create(MessageItem message, ChatPage page, Sprite shape)
         {
@@ -26,7 +32,7 @@ namespace Rovyn.UI
             ChatWidgets.Size(rect, -1, -1).ignoreLayout = true;
             rect.anchorMin = rect.anchorMax = rect.pivot = Vector2.one;
             int buttons = ChatPage.QuickReactionCount + 2;
-            rect.sizeDelta = new Vector2(buttons * (ButtonSize + Spacing) + 2 * Padding + 1, Height);
+            rect.sizeDelta = new Vector2(buttons * (ButtonSize + Spacing) + 2 * Padding + 1 + RemoveWidth + Spacing, Height);
 
             var actions = rect.gameObject.AddComponent<MessageActions>();
             actions._rect = rect;
@@ -62,18 +68,45 @@ namespace Rovyn.UI
             var line = divider.gameObject.AddComponent<UnityEngine.UI.Image>();
             line.color = Theme.Divider;
             line.raycastTarget = false;
-            ActionButton(shape, "Choose a reaction", () => _page.PickReaction(_message), out var picker);
+            _picker = ActionButton(shape, "Choose a reaction", () => _page.PickReaction(_message), out var picker);
             picker.fontSize = 18;
             EmojiCatalog.SetText(picker, "🙂");
 
-            var reply = ActionButton(shape, "Reply", () => _page.ReplyTo(_message), out var caption);
+            _reply = ActionButton(shape, "Reply", () => _page.ReplyTo(_message), out var caption);
             caption.gameObject.SetActive(false);
-            var icon = ChatWidgets.Rect(reply.transform, "Reply Arrow");
+            var icon = ChatWidgets.Rect(_reply.transform, "Reply Arrow");
             ChatWidgets.Stretch(icon, new Vector2(4, 4), new Vector2(-4, -4));
             var glyph = icon.gameObject.AddComponent<ReplyGlyph>();
             glyph.color = Theme.Interactive;
             glyph.raycastTarget = false;
+
+            _remove = ChatWidgets.Button(_rect, _message.body.font, shape, "Remove message", RemoveWidth,
+                ButtonSize, RemoveMessage, out var removeLabel);
+            _removeLabel = removeLabel;
+            _removeLabel.fontSize = 12;
         }
+
+        void RemoveMessage()
+        {
+            if (_message.IsOwnMessage && !_confirmDelete)
+            {
+                _confirmDelete = true;
+                RefreshRemoveLabel();
+                return;
+            }
+            _confirmDelete = false;
+            RefreshRemoveLabel();
+            _page.RemoveMessage(_message, _remove);
+        }
+
+        void RefreshRemoveLabel()
+        {
+            var label = !_message.IsOwnMessage ? "Hide for me" : _confirmDelete ? "Delete for all" : "Delete";
+            _remove.name = _removeLabel.text = label;
+            _removeLabel.color = _message.IsOwnMessage ? Theme.Red : Theme.TextNormal;
+        }
+
+        void OnDisable() => _confirmDelete = false;
 
         UnityEngine.UI.Button ActionButton(Sprite shape, string name, Action click, out TextMeshProUGUI label)
         {
@@ -99,6 +132,7 @@ namespace Rovyn.UI
                 _reactionButtons[i].name = $"React with {_recent[i]}";
                 EmojiCatalog.SetText(_reactionLabels[i], _recent[i]);
             }
+            RefreshRemoveLabel();
             Position();
             gameObject.SetActive(true);
         }
@@ -108,11 +142,19 @@ namespace Rovyn.UI
             var events = EventSystem.current;
             var focused = events != null ? events.currentSelectedGameObject : null;
             bool focusedInside = focused != null && focused.transform.IsChildOf(_message.transform);
-            if (!_page.composer.interactable || (!_message.PointerInside && !focusedInside))
+            if (!_message.PointerInside && !focusedInside)
             {
                 gameObject.SetActive(false);
                 return;
             }
+            if (_confirmDelete && UnityEngine.InputSystem.Keyboard.current?.escapeKey.wasPressedThisFrame == true)
+            {
+                _confirmDelete = false;
+                RefreshRemoveLabel();
+            }
+            bool canSend = _page.composer.interactable;
+            foreach (var button in _reactionButtons) button.interactable = canSend;
+            _picker.interactable = _reply.interactable = canSend;
             Position();
         }
 
